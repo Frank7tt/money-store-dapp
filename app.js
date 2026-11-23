@@ -60,8 +60,19 @@ $("connectBtn").onclick = async () => {
     const addr = $("contractAddr").value.trim();
     if (!ethers.isAddress(addr)) throw new Error("Invalid contract address");
 
+    await window.ethereum.request({ method: "eth_requestAccounts" });
+
+    // Contract lives on Sepolia: switch MetaMask there if needed
+    const SEPOLIA = "0xaa36a7";
+    if ((await window.ethereum.request({ method: "eth_chainId" })) !== SEPOLIA) {
+      setStatus("Please approve switching MetaMask to Sepolia...");
+      await window.ethereum.request({
+        method: "wallet_switchEthereumChain",
+        params: [{ chainId: SEPOLIA }]
+      });
+    }
+
     provider = new ethers.BrowserProvider(window.ethereum);
-    await provider.send("eth_requestAccounts", []);
     signer = await provider.getSigner();
     account = await signer.getAddress();
 
@@ -130,7 +141,7 @@ $("exitBtn").onclick = async () => {
 // Reset if user switches account/network in MetaMask
 if (window.ethereum) {
   window.ethereum.on?.("accountsChanged", () => location.reload());
-  window.ethereum.on?.("chainChanged", () => location.reload());
+  window.ethereum.on?.("chainChanged", () => { if (contract) location.reload(); });
 }
 
 // Prefill contract address (deployed on Sepolia) or last used one
