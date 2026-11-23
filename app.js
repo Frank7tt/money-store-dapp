@@ -1,23 +1,22 @@
-// Minimal ABI for MoneyStore.sol
+// MoneyStore contract on Sepolia
+const CONTRACT_ADDR = "0x66bff01fe3fe1d09a71a15c5f6218f536b471cd2";
+const SEPOLIA = "0xaa36a7";
 const ABI = [
-  "function deposit() payable",
-  "function transfer(address to, uint256 amount)",
-  "function withdraw(uint256 amount)",
-  "function exit()",
-  "function balanceOf(address user) view returns (uint256)",
-  "event Deposited(address indexed user, uint256 amount)",
-  "event Transferred(address indexed from, address indexed to, uint256 amount)",
-  "event Withdrawn(address indexed user, uint256 amount)"
+  "function transfer(address _payer, address _payee, uint256 _amount)",
+  "function store(address _depositor, uint256 _amount)",
+  "function transaction() view returns (string kind, address from, address to, uint256 amount, uint256 time)",
+  "function count() view returns (uint256)"
 ];
 
-let provider, signer, contract, account;
-
+let eth, provider, signer, contract, account;
 const $ = (id) => document.getElementById(id);
 
-function show(viewId) {
-  ["connectView", "mainView", "transferView"].forEach((v) =>
-    $(v).classList.toggle("hidden", v !== viewId)
+// ---------- Views ----------
+function show(id) {
+  ["welcomeView", "mainView", "transferView", "storeView"].forEach((v) =>
+    $(v).classList.toggle("hidden", v !== id)
   );
+  setStatus("");
 }
 
 function setStatus(msg, isError = false) {
@@ -26,128 +25,153 @@ function setStatus(msg, isError = false) {
 }
 
 function errMsg(e) {
+  if (e?.code === 4001 || e?.code === "ACTION_REJECTED") return "Request rejected in MetaMask.";
+  if (e?.code === -32002) return "A MetaMask request is already pending. Open MetaMask to approve it.";
   return e?.reason || e?.shortMessage || e?.info?.error?.message || e?.message || String(e);
 }
 
-async function refreshBalance() {
-  const bal = await contract.balanceOf(account);
-  $("balance").textContent = ethers.formatEther(bal);
+// ---------- Wallet (prefers MetaMask when several wallets are installed) ----------
+const wallets = [];
+window.addEventListener("eip6963:announceProvider", (ev) => wallets.push(ev.detail));
+window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+function findWallet() {
+  const mm = wallets.find((w) => w.info?.rdns === "io.metamask");
+  if (mm) return mm.provider;
+  if (wallets.length) return wallets[0].provider;
+  return window.ethereum || null;
 }
 
-// Run a transaction with button disabled + status messages
-async function runTx(button, label, sendTx) {
-  button.disabled = true;
-  try {
-    setStatus(`${label}: confirm in MetaMask...`);
-    const tx = await sendTx();
-    setStatus(`${label}: waiting for confirmation (${tx.hash.slice(0, 10)}...)`);
-    await tx.wait();
-    setStatus(`${label} successful ✅`);
-    await refreshBalance();
-    return true;
-  } catch (e) {
-    setStatus(`${label} failed: ${errMsg(e)}`, true);
-    return false;
-  } finally {
-    button.disabled = false;
-  }
-}
+async function connect() {
+  if (contract) return;
+  if (typeof ethers === "undefined") throw new Error("Failed to load ethers.js, please refresh.");
+  eth = findWallet();
+  if (!eth) throw new Error("MetaMask not found. Please install the MetaMask extension.");
 
-// ---------- Connect ----------
-$("connectBtn").onclick = async () => {
-  try {
-    if (!window.ethereum) throw new Error("MetaMask not found. Please install it.");
-    const addr = $("contractAddr").value.trim();
-    if (!ethers.isAddress(addr)) throw new Error("Invalid contract address");
+  setStatus("Connecting to MetaMask...");
+  await eth.request({ method: "eth_requestAccounts" });
 
-    await window.ethereum.request({ method: "eth_requestAccounts" });
-
-    // Contract lives on Sepolia: switch MetaMask there if needed
-    const SEPOLIA = "0xaa36a7";
-    if ((await window.ethereum.request({ method: "eth_chainId" })) !== SEPOLIA) {
-      setStatus("Please approve switching MetaMask to Sepolia...");
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: SEPOLIA }]
+  if ((await eth.request({ method: "eth_chainId" })) !== SEPOLIA) {
+    setStatus("Please approve switching MetaMask to Sepolia...");
+    try {
+      await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: SEPOLIA }] });
+    } catch (e) {
+      if (e?.code !== 4902) throw e;
+      await eth.request({
+        method: "wallet_addEthereumChain",
+        params: [{
+          chainId: SEPOLIA,
+          chainName: "Sepolia",
+          nativeCurrency: { name: "SepoliaETH", symbol: "ETH", decimals: 18 },
+          rpcUrls: ["https://rpc.sepolia.org"],
+          blockExplorerUrls: ["https://sepolia.etherscan.io"]
+        }]
       });
     }
-
-    provider = new ethers.BrowserProvider(window.ethereum);
-    signer = await provider.getSigner();
-    account = await signer.getAddress();
-
-    const code = await provider.getCode(addr);
-    if (code === "0x") throw new Error("No contract at this address on the current network");
-
-    contract = new ethers.Contract(addr, ABI, signer);
-    localStorage.setItem("moneyStoreAddr", addr);
-
-    $("account").textContent = account;
-    await refreshBalance();
-    show("mainView");
-    setStatus("Connected");
-  } catch (e) {
-    setStatus(errMsg(e), true);
   }
+
+  provider = new ethers.BrowserProvider(eth);
+  signer = await provider.getSigner();
+  account = await signer.getAddress();
+  contract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
+  eth.on?.("accountsChanged", () => location.reload());
+  eth.on?.("chainChanged", () => location.reload());
+  setStatus("");
+}
+
+async function run(btn, fn) {
+  btn.disabled = true;
+  try { await fn(); }
+  catch (e) { setStatus(errMsg(e), true); }
+  finally { btn.disabled = false; }
+}
+
+function checkAddr(a, label) {
+  if (!ethers.isAddress(a)) throw new Error(`Please enter a valid ${label} address.`);
+}
+function checkAmount(v) {
+  if (!/^\d+$/.test(v) || BigInt(v) === 0n) throw new Error("Please enter a positive whole number amount.");
+}
+
+async function sendTx(label, txPromise) {
+  setStatus(`${label}: please confirm in MetaMask...`);
+  const tx = await txPromise;
+  setStatus(`${label}: waiting for confirmation...\nTx: ${tx.hash}`);
+  await tx.wait();
+  setStatus(`${label} successful ✅\nTx: ${tx.hash}`);
+}
+
+// ---------- Welcome ----------
+$("nameForm").onsubmit = (e) => {
+  e.preventDefault();
+  const name = $("name").value.trim();
+  if (!name) return setStatus("Please enter your name.", true);
+  try { sessionStorage.setItem("name", name); } catch (_) {}
+  $("hello").textContent = `Hello, ${name}`;
+  show("mainView");
 };
 
-// ---------- Store money ----------
-$("depositBtn").onclick = async () => {
-  const amt = $("depositAmt").value;
-  if (!amt || Number(amt) <= 0) return setStatus("Enter an amount to store", true);
-  const ok = await runTx($("depositBtn"), "Store money", () =>
-    contract.deposit({ value: ethers.parseEther(amt) })
-  );
-  if (ok) $("depositAmt").value = "";
+// ---------- Navigation ----------
+document.querySelectorAll("[data-go]").forEach((b) => {
+  b.onclick = () => {
+    show(b.dataset.go);
+    // Prefill payer / depositor with the connected account
+    if (b.dataset.go === "transferView" || b.dataset.go === "storeView") {
+      run(b, async () => {
+        await connect();
+        if (!$("payer").value) $("payer").value = account;
+        if (!$("depositor").value) $("depositor").value = account;
+      });
+    }
+  };
+});
+
+$("exitBtn").onclick = () => {
+  try { sessionStorage.removeItem("name"); } catch (_) {}
+  $("name").value = "";
+  show("welcomeView");
 };
 
 // ---------- Transfer Money ----------
-$("goTransferBtn").onclick = () => {
-  setStatus("");
-  show("transferView");
-};
-$("backBtn").onclick = () => show("mainView");
+$("transferBtn").onclick = () => run($("transferBtn"), async () => {
+  const payer = $("payer").value.trim();
+  const payee = $("payee").value.trim();
+  const amt = $("tAmount").value.trim();
+  checkAddr(payer, "payer");
+  checkAddr(payee, "payee");
+  checkAmount(amt);
+  await connect();
+  await sendTx("Transfer", contract.transfer(payer, payee, amt));
+});
 
-$("transferBtn").onclick = async () => {
-  const to = $("toAddr").value.trim();
-  const amt = $("transferAmt").value;
-  if (!ethers.isAddress(to)) return setStatus("Invalid recipient address", true);
-  if (to.toLowerCase() === account.toLowerCase()) return setStatus("Cannot transfer to yourself", true);
-  if (!amt || Number(amt) <= 0) return setStatus("Enter an amount", true);
+// ---------- Store Money ----------
+$("storeBtn").onclick = () => run($("storeBtn"), async () => {
+  const dep = $("depositor").value.trim();
+  const amt = $("sAmount").value.trim();
+  checkAddr(dep, "depositor");
+  checkAmount(amt);
+  await connect();
+  await sendTx("Store", contract.store(dep, amt));
+});
 
-  const ok = await runTx($("transferBtn"), "Transfer", () =>
-    contract.transfer(to, ethers.parseEther(amt))
-  );
-  if (ok) {
-    $("toAddr").value = "";
-    $("transferAmt").value = "";
-    show("mainView");
-  }
-};
+// ---------- transaction: show the latest record ----------
+document.querySelectorAll("[data-tx]").forEach((b) => {
+  b.onclick = () => run(b, async () => {
+    await connect();
+    setStatus("Loading latest transaction...");
+    if ((await contract.count()) === 0n) return setStatus("No transaction yet.");
+    const r = await contract.transaction();
+    const when = new Date(Number(r.time) * 1000).toLocaleString();
+    setStatus(
+      r.kind === "transfer"
+        ? `Latest transaction (Transfer Money)\nPayer: ${r.from}\nPayee: ${r.to}\nAmount: ${r.amount}\nTime: ${when}`
+        : `Latest transaction (Store Money)\nDepositor: ${r.from}\nAmount: ${r.amount}\nTime: ${when}`
+    );
+  });
+});
 
-// ---------- Exit: withdraw everything, then disconnect ----------
-$("exitBtn").onclick = async () => {
-  const bal = await contract.balanceOf(account);
-  if (bal > 0n) {
-    if (!confirm(`Withdraw all ${ethers.formatEther(bal)} ETH to your wallet and exit?`)) return;
-    const ok = await runTx($("exitBtn"), "Exit (withdraw all)", () => contract.exit());
-    if (!ok) return;
-  }
-  contract = signer = provider = account = null;
-  show("connectView");
-  setStatus("You have exited. Goodbye 👋");
-};
-
-// Reset if user switches account/network in MetaMask
-if (window.ethereum) {
-  window.ethereum.on?.("accountsChanged", () => location.reload());
-  window.ethereum.on?.("chainChanged", () => { if (contract) location.reload(); });
-}
-
-// Prefill contract address (deployed on Sepolia) or last used one
-const DEFAULT_ADDR = "0xAcEb57f4b812fB9938185B182a50C3C2f1BBbe8f";
+// Restore name after refresh
 try {
-  $("contractAddr").value = localStorage.getItem("moneyStoreAddr") || DEFAULT_ADDR;
-} catch (_) {
-  $("contractAddr").value = DEFAULT_ADDR;
-}
+  const saved = sessionStorage.getItem("name");
+  if (saved) { $("hello").textContent = `Hello, ${saved}`; show("mainView"); }
+} catch (_) {}
